@@ -1,0 +1,147 @@
+name: Build Windows prebuilt
+
+# タグ push で起動し、上流 getsentry/sentry-native を fresh clone して
+# Windows 11 x64 / MSVC / Release / 静的 lib / crashpad backend でビルドする。
+
+on:
+  push:
+    tags:
+      - "v*-win"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag/SHA to build (e.g., 0.13.7)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout self (workflow only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Determine upstream ref and release tag
+        id: ref
+        shell: bash
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.upstream_ref }}" ]; then
+            REF="${{ github.event.inputs.upstream_ref }}"
+            TAG="v${REF}-win"
+          else
+            TAG="${{ github.ref_name }}"
+            REF="${TAG#v}"
+            REF="${REF%-win}"
+          fi
+          echo "upstream_ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building upstream=$REF release_tag=$TAG"
+
+      - name: Clone upstream at tag
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 --branch "${{ steps.ref.outputs.upstream_ref }}" \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/getsentry/sentry-native.git upstream-src
+          git -C upstream-src rev-parse HEAD > upstream_sha.txt
+          echo "Upstream SHA: $(cat upstream_sha.txt)"
+
+      - name: Setup MSBuild (VS2022)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: CMake configure
+        shell: pwsh
+        working-directory: upstream-src
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DSENTRY_BUILD_SHARED_LIBS=OFF `
+            -DSENTRY_BUILD_RUNTIMESTATIC=OFF `
+            -DSENTRY_BACKEND=crashpad `
+            -DSENTRY_TRANSPORT=winhttp `
+            -DSENTRY_BUILD_TESTS=OFF `
+            -DSENTRY_BUILD_EXAMPLES=OFF
+
+      - name: Build (Release)
+        shell: pwsh
+        working-directory: upstream-src
+        run: cmake --build build --config Release --parallel
+
+      - name: Install to staging
+        shell: pwsh
+        working-directory: upstream-src
+        run: cmake --install build --config Release --prefix ../install
+
+      - name: Write manifest.json
+        shell: pwsh
+        run: |
+          $sha = (Get-Content upstream_sha.txt -Raw).Trim()
+          $ref = "${{ steps.ref.outputs.upstream_ref }}"
+          $tag = "${{ steps.ref.outputs.release_tag }}"
+          $vs  = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property catalog_productDisplayVersion
+          $obj = [ordered]@{
+            upstream_repo = "getsentry/sentry-native"
+            upstream_ref  = $ref
+            upstream_sha  = $sha
+            release_tag   = $tag
+            crt           = "MD"
+            config        = "Release"
+            backend       = "crashpad"
+            transport     = "winhttp"
+            toolset       = "MSVC"
+            visualstudio  = "$vs"
+            os            = "$env:ImageOS"
+            runner        = "$env:ImageVersion"
+          }
+          $obj | ConvertTo-Json -Depth 5 | Out-File -FilePath install\manifest.json -Encoding utf8
+
+      - name: Compute SHA256SUMS
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -LiteralPath install -Recurse -File -Force -ErrorAction SilentlyContinue
+          $out = New-Object System.Collections.Generic.List[string]
+          foreach ($f in $files) {
+            try {
+              $h = Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName -ErrorAction Stop
+              $rel = $f.FullName.Substring((Resolve-Path install).Path.Length + 1)
+              $out.Add("$($h.Hash)  $rel")
+            } catch {
+              Write-Warning "Skip hashing: $($f.FullName) - $($_.Exception.Message)"
+            }
+          }
+          $out | Set-Content install\SHA256SUMS.txt -Encoding ascii
+
+      - name: Make archive
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ref.outputs.release_tag }}"
+          $zip = "sentry-native_${tag}_win11_x64_Release_MD_static.zip"
+          if (-not (Test-Path install)) { throw "install directory not found" }
+          if (-not (Get-ChildItem install -Recurse -File)) { throw "install is empty" }
+          Compress-Archive -Path install\* -DestinationPath $zip -Force
+          if (-not (Test-Path $zip)) { throw "ZIP not created: $zip" }
+          "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      - name: Validate archive
+        shell: pwsh
+        run: |
+          if (-not $env:ZIP_NAME) { throw "ZIP_NAME env var is empty" }
+          if (-not (Test-Path $env:ZIP_NAME)) { throw "Archive not found: $env:ZIP_NAME" }
+          Write-Host "ZIP size: $((Get-Item $env:ZIP_NAME).Length) bytes"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 14

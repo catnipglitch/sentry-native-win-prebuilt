@@ -1,0 +1,14 @@
+# Claude Code local settings (per-user permissions, never share)
+.claude/settings.local.json
+
+# 上流ソースの CI 上での作業ディレクトリ（万が一ローカルで試したときの保険）
+upstream-src/
+install/
+build/
+*.zip
+
+# Editors / OS
+.vs/
+.idea/
+.vscode/
+.DS_Store
