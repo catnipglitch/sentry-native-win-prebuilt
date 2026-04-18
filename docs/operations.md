@@ -114,7 +114,7 @@
 
 **PAT 期限切れ時**: sync ワークフローが checkout 失敗して exit する。更新して同名 secret を再設定するだけ。
 
-## 運用 Runbook
+# 運用 Runbook
 
 ### 正常系（毎月自動）
 
